@@ -1,0 +1,67 @@
+plugins {
+    id "com.android.application"
+}
+
+def ninjaSource = file("D:/ninja-win/ninja.exe")
+def ninjaForAgp = rootProject.file("ninja.exe")
+
+def prepareNinjaForCmake = tasks.register("prepareNinjaForCmake") {
+    inputs.file(ninjaSource)
+    outputs.file(ninjaForAgp)
+    doLast {
+        if (!ninjaSource.exists()) {
+            throw new GradleException("ninja.exe not found at ${ninjaSource}. Please check D:/ninja-win.")
+        }
+        copy {
+            from ninjaSource
+            into rootProject.projectDir
+        }
+    }
+}
+
+tasks.configureEach { task ->
+    if (task.name.startsWith("configureCMake") ||
+            task.name.startsWith("buildCMake") ||
+            task.name.startsWith("externalNativeBuild")) {
+        task.dependsOn(prepareNinjaForCmake)
+    }
+}
+
+android {
+    namespace "com.tencent.simplespeech"
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.tencent.simplespeech"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "0.1.0"
+
+        externalNativeBuild {
+            cmake {
+                cppFlags "-std=c++17 -fexceptions -frtti"
+                arguments "-DANDROID_STL=c++_shared",
+                        "-DCMAKE_MAKE_PROGRAM=D:/ninja-win/ninja.exe",
+                        "-DSIMPLE_SPEECH_WITH_LLAMA=ON",
+                        "-DSIMPLE_SPEECH_WITH_OPENCL=ON",
+                        "-DLLAMA_CPP_DIR=E:/Codes/simple-speech/third_party/llama.cpp",
+                        "-DOPENCL_SDK_ROOT=D:/Adreno_OpenCL_SDK.Core.2.4.1.All-AnyCPU-opencl-sdk-2.4.1/opencl-sdk",
+                        "-DOpenCL_LIBRARY=D:/Adreno_OpenCL_SDK.Core.2.4.1.All-AnyCPU-opencl-sdk-2.4.1/opencl-sdk/libs/Android/libOpenCL.so",
+                        "-DOpenCL_INCLUDE_DIR=D:/Adreno_OpenCL_SDK.Core.2.4.1.All-AnyCPU-opencl-sdk-2.4.1/opencl-sdk/inc"
+            }
+        }
+
+        ndk {
+            abiFilters "arm64-v8a"
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.5"
+        }
+    }
+
+}

@@ -1,0 +1,8 @@
+.gradle/
+build/
+app/build/
+app/.cxx/
+ninja.exe
+*.iml
+.idea/
+local.properties
