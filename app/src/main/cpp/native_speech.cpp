@@ -1,5 +1,6 @@
 #include <jni.h>
 #include <android/log.h>
+#include <dlfcn.h>
 
 #if defined(SIMPLE_SPEECH_WITH_LLAMA)
 #include "llama.h"
@@ -8,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -20,7 +22,7 @@ namespace {
 
 constexpr const char * kTag = "SimpleSpeechNative";
 constexpr int kDefaultMaxPredictTokens = 64;
-constexpr int kMaxAllowedPredictTokens = 512;
+constexpr int kMaxAllowedPredictTokens = 4096;
 constexpr int kRepeatPenaltyLastN = 64;
 constexpr float kRepeatPenalty = 1.15f;
 constexpr int kSamplingTopK = 20;
@@ -122,7 +124,7 @@ struct LlamaEngine {
     const llama_vocab * vocab = nullptr;
     llama_sampler * sampler = nullptr;
     int n_threads = 4;
-    int n_ctx = 1024;
+    int n_ctx = 8192;
     int n_gpu_layers = 0;
 
     ~LlamaEngine() {
@@ -141,6 +143,116 @@ struct LlamaEngine {
 std::mutex g_mutex;
 std::unique_ptr<LlamaEngine> g_engine;
 bool g_backend_ready = false;
+bool g_cpu_backend_ready = false;
+bool g_opencl_backend_ready = false;
+void * g_opencl_runtime = nullptr;
+
+bool preload_opencl_runtime(const std::string &backend_dir, std::string &error) {
+    if (g_opencl_runtime) {
+        return true;
+    }
+    dlerror();
+    g_opencl_runtime = dlopen("libOpenCL.so", RTLD_NOW | RTLD_GLOBAL);
+    if (g_opencl_runtime) {
+        __android_log_print(ANDROID_LOG_INFO, kTag, "loaded OpenCL runtime by soname libOpenCL.so");
+        return true;
+    }
+
+    const char * soname_error = dlerror();
+    const std::vector<std::string> paths = {
+            "/vendor/lib64/libOpenCL.so",
+            "/system/vendor/lib64/libOpenCL.so",
+            "/system/lib64/libOpenCL.so"
+    };
+    std::ostringstream failures;
+    failures << "libOpenCL.so";
+    if (soname_error) {
+        failures << " (" << soname_error << ")";
+    }
+    failures << "; ";
+    for (const std::string &path : paths) {
+        dlerror();
+        g_opencl_runtime = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
+        if (g_opencl_runtime) {
+            __android_log_print(ANDROID_LOG_INFO, kTag, "loaded OpenCL runtime from %s", path.c_str());
+            return true;
+        }
+        const char * dl_error = dlerror();
+        failures << path;
+        if (dl_error) {
+            failures << " (" << dl_error << ")";
+        }
+        failures << "; ";
+    }
+    (void) backend_dir;
+    error = "failed to load OpenCL runtime: " + failures.str();
+    return false;
+}
+
+void configure_opencl_runtime() {
+#if defined(SIMPLE_SPEECH_WITH_OPENCL)
+    setenv("GGML_OPENCL_ADRENO_XMEM_GEMM", "1", 0);
+    setenv("GGML_OPENCL_ADRENO_USE_LARGE_BUFFER", "1", 0);
+    __android_log_print(ANDROID_LOG_INFO, kTag,
+                        "configured OpenCL env: ADRENO_XMEM_GEMM=%s, ADRENO_USE_LARGE_BUFFER=%s",
+                        getenv("GGML_OPENCL_ADRENO_XMEM_GEMM") ? "on" : "off",
+                        getenv("GGML_OPENCL_ADRENO_USE_LARGE_BUFFER") ? "on" : "off");
+#else
+    (void) 0;
+#endif
+}
+
+bool load_backend_library(const std::string &backend_dir, const char *name, std::string &error) {
+    if (backend_dir.empty()) {
+        error = std::string("backend library directory is empty, cannot load ") + name;
+        return false;
+    }
+    const std::filesystem::path path = std::filesystem::path(backend_dir) /
+            (std::string("libggml-") + name + ".so");
+    if (!std::filesystem::exists(path)) {
+        error = "backend library not found: " + path.string();
+        return false;
+    }
+    if (std::string(name) == "opencl") {
+        configure_opencl_runtime();
+        if (!preload_opencl_runtime(backend_dir, error)) {
+            return false;
+        }
+    }
+    ggml_backend_reg_t reg = ggml_backend_load(path.string().c_str());
+    if (!reg) {
+        error = "failed to load backend library: " + path.string();
+        return false;
+    }
+    __android_log_print(ANDROID_LOG_INFO, kTag, "loaded backend %s from %s", name, path.string().c_str());
+    return true;
+}
+
+bool ensure_backends(const std::string &backend_dir, bool need_opencl, std::string &error) {
+    if (!g_backend_ready) {
+        llama_backend_init();
+        g_backend_ready = true;
+    }
+#if defined(SIMPLE_SPEECH_WITH_OPENCL)
+    if (!g_cpu_backend_ready) {
+        if (!load_backend_library(backend_dir, "cpu", error)) {
+            return false;
+        }
+        g_cpu_backend_ready = true;
+    }
+    if (need_opencl && !g_opencl_backend_ready) {
+        if (!load_backend_library(backend_dir, "opencl", error)) {
+            return false;
+        }
+        g_opencl_backend_ready = true;
+    }
+#else
+    (void) backend_dir;
+    (void) need_opencl;
+    ggml_backend_load_all();
+#endif
+    return true;
+}
 
 int choose_threads() {
     const unsigned hw = std::thread::hardware_concurrency();
@@ -211,16 +323,14 @@ bool has_repeated_tail(const std::vector<llama_token> &tokens, int ngram, int re
     return true;
 }
 
-LlamaEngine * ensure_engine(const std::string &path, bool use_gpu, std::string &error) {
-    if (!g_backend_ready) {
-        llama_backend_init();
-        ggml_backend_load_all();
-        g_backend_ready = true;
+LlamaEngine * ensure_engine(const std::string &path, const std::string &backend_dir, bool use_gpu, std::string &error) {
+    const bool can_use_gpu = use_gpu && !contains_ci(path, "1.25bit");
+    if (!ensure_backends(backend_dir, can_use_gpu, error)) {
+        return nullptr;
     }
-
     int gpu_layers = 0;
 #if defined(SIMPLE_SPEECH_WITH_OPENCL)
-    gpu_layers = use_gpu && !contains_ci(path, "1.25bit") ? 99 : 0;
+    gpu_layers = can_use_gpu ? 99 : 0;
 #else
     (void) use_gpu;
 #endif
@@ -249,7 +359,7 @@ LlamaEngine * ensure_engine(const std::string &path, bool use_gpu, std::string &
     cparams.n_batch = 512;
     cparams.n_threads = next->n_threads;
     cparams.n_threads_batch = next->n_threads;
-    cparams.no_perf = true;
+    cparams.no_perf = false;
     next->ctx = llama_init_from_model(next->model, cparams);
     if (!next->ctx) {
         error = "llama."
@@ -258,7 +368,7 @@ LlamaEngine * ensure_engine(const std::string &path, bool use_gpu, std::string &
     }
 
     llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
-    sparams.no_perf = true;
+    sparams.no_perf = false;
     next->sampler = llama_sampler_chain_init(sparams);
     llama_sampler_chain_add(next->sampler, llama_sampler_init_top_k(kSamplingTopK));
     llama_sampler_chain_add(next->sampler, llama_sampler_init_top_p(kSamplingTopP, 1));
@@ -281,6 +391,7 @@ LlamaEngine * ensure_engine(const std::string &path, bool use_gpu, std::string &
 
 std::string run_llama_translation(
         const std::string &path,
+        const std::string &backend_dir,
         const std::string &source,
         const std::string &target,
         const std::string &input,
@@ -290,13 +401,15 @@ std::string run_llama_translation(
     max_predict_tokens = std::max(1, std::min(kMaxAllowedPredictTokens, max_predict_tokens));
     std::string error;
 
-    LlamaEngine * engine = ensure_engine(path, use_gpu, error);
+    LlamaEngine * engine = ensure_engine(path, backend_dir, use_gpu, error);
     if (!engine) {
         return error;
     }
 
     llama_memory_clear(llama_get_memory(engine->ctx), true);
     llama_sampler_reset(engine->sampler);
+    llama_perf_context_reset(engine->ctx);
+    llama_perf_sampler_reset(engine->sampler);
 
     const std::string prompt = build_prompt(source, target, input);
 
@@ -336,15 +449,21 @@ std::string run_llama_translation(
     int n_pos = 0;
     const int n_prompt = static_cast<int>(tokens.size());
     int generated_count = 0;
-    int prefill_ms = -1;
+    long long prefill_ms = -1;
+    std::chrono::steady_clock::time_point prefill_end;
     for (int i = 0; i < max_predict_tokens && n_pos + batch.n_tokens < n_prompt + max_predict_tokens; ++i) {
         if (llama_decode(engine->ctx, batch) != 0) {
             return "llama_decode 失败";
         }
         if (i == 0) {
-            prefill_ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - infer_start).count());
-            __android_log_print(ANDROID_LOG_INFO, kTag, "prefill finished in %d ms", prefill_ms);
+            llama_synchronize(engine->ctx);
+            prefill_end = std::chrono::steady_clock::now();
+            prefill_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    prefill_end - infer_start).count();
+            __android_log_print(ANDROID_LOG_INFO, kTag, "prefill synchronized in %lld ms",
+                                static_cast<long long>(prefill_ms));
+        } else {
+            llama_synchronize(engine->ctx);
         }
         n_pos += batch.n_tokens;
 
@@ -373,14 +492,31 @@ std::string run_llama_translation(
     if (output.empty()) {
         return "模型没有生成翻译结果";
     }
+    llama_synchronize(engine->ctx);
+    const auto infer_end = std::chrono::steady_clock::now();
     const auto infer_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - infer_start).count();
-    const long long decode_ms = prefill_ms >= 0 ? std::max<long long>(1, infer_ms - prefill_ms) : std::max<long long>(1, infer_ms);
-    const double tok_per_s = generated_count > 0 ? generated_count * 1000.0 / decode_ms : 0.0;
+            infer_end - infer_start).count();
+    const long long decode_ms = prefill_ms >= 0 ? std::max<long long>(1,
+            std::chrono::duration_cast<std::chrono::milliseconds>(infer_end - prefill_end).count()) :
+            std::max<long long>(1, infer_ms);
+    const double prefill_tok_per_s = prefill_ms > 0 ? tokens.size() * 1000.0 / prefill_ms : 0.0;
+    const double decode_tok_per_s = generated_count > 0 ? generated_count * 1000.0 / decode_ms : 0.0;
+    const llama_perf_context_data perf = llama_perf_context(engine->ctx);
+    const llama_perf_sampler_data sampler_perf = llama_perf_sampler(engine->sampler);
     __android_log_print(ANDROID_LOG_INFO, kTag,
-                        "translation finished in %lld ms, prefill=%d ms, generated=%d, decode=%.2f tok/s, output_bytes=%zu",
-                        static_cast<long long>(infer_ms), prefill_ms, generated_count, tok_per_s, output.size());
-    return output;
+                        "translation synchronized in %lld ms, prefill=%lld ms %.2f tok/s, decode=%lld ms generated=%d %.2f tok/s, output_bytes=%zu",
+                        static_cast<long long>(infer_ms), static_cast<long long>(prefill_ms),
+                        prefill_tok_per_s, decode_ms, generated_count, decode_tok_per_s, output.size());
+    __android_log_print(ANDROID_LOG_INFO, kTag,
+                        "llama perf: p_eval=%.2f ms/%d tok, eval=%.2f ms/%d tok, sample=%.2f ms/%d tok, reused=%d",
+                        perf.t_p_eval_ms, perf.n_p_eval, perf.t_eval_ms, perf.n_eval,
+                        sampler_perf.t_sample_ms, sampler_perf.n_sample, perf.n_reused);
+    std::ostringstream result;
+    result << output
+           << "\n\n<|simple_speech_stats|>"
+           << "prefill=" << prefill_tok_per_s
+           << ";decode=" << decode_tok_per_s;
+    return result.str();
 }
 
 #endif
@@ -403,6 +539,7 @@ std::string status_for(const std::string &root) {
 
 std::string translate_impl(
         const std::string &root,
+        const std::string &backend_dir,
         const std::string &model,
         const std::string &source,
         const std::string &target,
@@ -415,7 +552,7 @@ std::string translate_impl(
     }
 
 #if defined(SIMPLE_SPEECH_WITH_LLAMA)
-    return run_llama_translation(path.string(), source, target, input, use_gpu, max_predict_tokens);
+    return run_llama_translation(path.string(), backend_dir, source, target, input, use_gpu, max_predict_tokens);
 #else
     std::ostringstream oss;
     oss << "已找到模型，但当前 APK 使用占位后端。\n"
@@ -438,6 +575,7 @@ Java_com_tencent_simplespeech_NativeSpeechEngine_translate(
         JNIEnv *env,
         jclass,
         jstring model_root,
+        jstring native_library_dir,
         jstring model_name,
         jstring source_language,
         jstring target_language,
@@ -446,6 +584,7 @@ Java_com_tencent_simplespeech_NativeSpeechEngine_translate(
         jint max_predict_tokens) {
     return to_jstring(env, translate_impl(
             to_string(env, model_root),
+            to_string(env, native_library_dir),
             to_string(env, model_name),
             to_string(env, source_language),
             to_string(env, target_language),

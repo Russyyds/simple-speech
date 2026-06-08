@@ -46,9 +46,7 @@ android {
                         "-DSIMPLE_SPEECH_WITH_LLAMA=ON",
                         "-DSIMPLE_SPEECH_WITH_OPENCL=ON",
                         "-DLLAMA_CPP_DIR=E:/Codes/simple-speech/third_party/llama.cpp",
-                        "-DOPENCL_SDK_ROOT=D:/Adreno_OpenCL_SDK.Core.2.4.1.All-AnyCPU-opencl-sdk-2.4.1/opencl-sdk",
-                        "-DOpenCL_LIBRARY=D:/Adreno_OpenCL_SDK.Core.2.4.1.All-AnyCPU-opencl-sdk-2.4.1/opencl-sdk/libs/Android/libOpenCL.so",
-                        "-DOpenCL_INCLUDE_DIR=D:/Adreno_OpenCL_SDK.Core.2.4.1.All-AnyCPU-opencl-sdk-2.4.1/opencl-sdk/inc"
+                        "-DOPENCL_SDK_ROOT=D:/Adreno_OpenCL_SDK.Core.2.4.1.All-AnyCPU-opencl-sdk-2.4.1/opencl-sdk"
             }
         }
 
@@ -61,6 +59,12 @@ android {
         cmake {
             path "src/main/cpp/CMakeLists.txt"
             version "3.22.5"
+        }
+    }
+
+    packagingOptions {
+        jniLibs {
+            excludes += ["**/libOpenCL.so"]
         }
     }
 

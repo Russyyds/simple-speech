@@ -6,6 +6,9 @@
         android:extractNativeLibs="true"
         android:label="Simple Speech"
         android:theme="@style/AppTheme">
+        <uses-native-library
+            android:name="libOpenCL.so"
+            android:required="false" />
         <activity
             android:name=".MainActivity"
             android:exported="true">
