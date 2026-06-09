@@ -2,6 +2,8 @@ package com.tencent.simplespeech;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.app.ProgressDialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
@@ -24,12 +26,23 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLEncoder;
 import java.util.Locale;
+
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
 
 public class MainActivity extends Activity {
     private static final int DEFAULT_MAX_TOKENS = 4096;
     private static final int MAX_TOKENS = 4096;
     private static final String STATS_MARKER = "\n\n<|simple_speech_stats|>";
+    private static final String HF_MIRROR_BASE = "https://hf-mirror.com/";
 
     private static final String[] TRANSLATION_MODELS = {
             "Hy-MT1.5-1.8B-1.25bit",
@@ -72,6 +85,7 @@ public class MainActivity extends Activity {
     private String modelRoot;
     private String internalModelRoot;
     private String externalModelRoot;
+    private volatile boolean isDownloadingModel;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -212,12 +226,17 @@ public class MainActivity extends Activity {
             int maxPredictTokens = parseMaxTokens(maxTokens.getText().toString());
             maxTokens.setText(String.valueOf(maxPredictTokens));
             boolean useGpuBackend = useGpu.isChecked();
+            String selectedModel = model.getSelectedItem().toString();
+            String selectedModelRoot = effectiveModelRoot(selectedModel);
+            if (!hasModelFile(selectedModelRoot, selectedModel)) {
+                promptDownloadModel(selectedModel, result, speed);
+                return;
+            }
             result.setText("正在翻译...");
             speed.setText("速度：prefill -- tok/s，decode -- tok/s");
             new Thread(() -> {
-                String selectedModel = model.getSelectedItem().toString();
                 String out = NativeSpeechEngine.translate(
-                        effectiveModelRoot(selectedModel),
+                        selectedModelRoot,
                         getApplicationInfo().nativeLibraryDir,
                         selectedModel,
                         LANGUAGE_PROMPTS[source.getSelectedItemPosition()],
@@ -414,14 +433,230 @@ public class MainActivity extends Activity {
         return internalModelRoot;
     }
 
+    private void promptDownloadModel(String modelName, TextView result, TextView speed) {
+        ModelDownloadSpec spec = downloadSpecForModel(modelName);
+        if (spec == null) {
+            new AlertDialog.Builder(this)
+                    .setTitle("缺少模型文件")
+                    .setMessage("当前模型没有配置自动下载源，请手动放入对应的 GGUF 文件。")
+                    .setPositiveButton("确定", null)
+                    .show();
+            return;
+        }
+        if (isDownloadingModel) {
+            Toast.makeText(this, "模型正在下载中", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        File targetDir = new File(internalModelRoot, modelName);
+        String message = "未找到 " + modelName + " 的 GGUF 文件。\n\n"
+                + "将从 HF 镜像下载：\n"
+                + HF_MIRROR_BASE + spec.repoId + "\n\n"
+                + "保存到：\n" + targetDir.getAbsolutePath();
+        new AlertDialog.Builder(this)
+                .setTitle("下载模型文件")
+                .setMessage(message)
+                .setNegativeButton("取消", null)
+                .setPositiveButton("确定", (dialog, which) -> startModelDownload(spec, targetDir, result, speed))
+                .show();
+    }
+
+    private void startModelDownload(ModelDownloadSpec spec, File targetDir, TextView result, TextView speed) {
+        isDownloadingModel = true;
+        ProgressDialog progressDialog = new ProgressDialog(this);
+        progressDialog.setTitle("下载模型文件");
+        progressDialog.setMessage("正在查询模型文件...");
+        progressDialog.setProgressStyle(ProgressDialog.STYLE_HORIZONTAL);
+        progressDialog.setIndeterminate(true);
+        progressDialog.setMax(100);
+        progressDialog.setProgress(0);
+        progressDialog.setCancelable(false);
+        progressDialog.show();
+        result.setText("正在查询模型文件...");
+        speed.setText("模型下载中");
+        new Thread(() -> {
+            try {
+                String fileName = findRemoteGgufFile(spec);
+                if (fileName == null) {
+                    throw new IOException("仓库中未找到匹配的 GGUF 文件");
+                }
+                runOnUiThread(() -> {
+                    progressDialog.setIndeterminate(true);
+                    progressDialog.setMessage("准备下载 " + new File(fileName).getName());
+                });
+                downloadModelFile(spec.repoId, fileName, targetDir, result, progressDialog);
+                runOnUiThread(() -> {
+                    progressDialog.dismiss();
+                    result.setText("模型下载完成，请重新点击翻译。");
+                    speed.setText("速度：prefill -- tok/s，decode -- tok/s");
+                    Toast.makeText(this, "模型下载完成", Toast.LENGTH_SHORT).show();
+                });
+            } catch (IOException | JSONException e) {
+                runOnUiThread(() -> {
+                    progressDialog.dismiss();
+                    result.setText("模型下载失败：" + e.getMessage());
+                    speed.setText("速度：prefill -- tok/s，decode -- tok/s");
+                });
+            } finally {
+                isDownloadingModel = false;
+            }
+        }).start();
+    }
+
+    private String findRemoteGgufFile(ModelDownloadSpec spec) throws IOException, JSONException {
+        String apiUrl = HF_MIRROR_BASE + "api/models/" + spec.repoId;
+        HttpURLConnection connection = openConnection(apiUrl);
+        try {
+            if (connection.getResponseCode() != HttpURLConnection.HTTP_OK) {
+                throw new IOException("模型列表请求失败，HTTP " + connection.getResponseCode());
+            }
+            JSONObject body = new JSONObject(readUtf8(connection.getInputStream()));
+            JSONArray siblings = body.getJSONArray("siblings");
+            for (int i = 0; i < siblings.length(); ++i) {
+                String name = siblings.getJSONObject(i).optString("rfilename", "");
+                String lowerName = name.toLowerCase(Locale.US);
+                if (lowerName.endsWith(".gguf") && fileMatchesModelName(name, spec.modelName)) {
+                    return name;
+                }
+            }
+        } finally {
+            connection.disconnect();
+        }
+        return null;
+    }
+
+    private void downloadModelFile(String repoId, String fileName, File targetDir, TextView result,
+                                   ProgressDialog progressDialog) throws IOException {
+        if (!targetDir.exists() && !targetDir.mkdirs()) {
+            throw new IOException("无法创建目录：" + targetDir.getAbsolutePath());
+        }
+        File targetFile = new File(targetDir, new File(fileName).getName());
+        File partFile = new File(targetDir, targetFile.getName() + ".part");
+        String downloadUrl = HF_MIRROR_BASE + repoId + "/resolve/main/" + encodePath(fileName);
+        HttpURLConnection connection = openConnection(downloadUrl);
+        try {
+            int code = connection.getResponseCode();
+            if (code != HttpURLConnection.HTTP_OK) {
+                throw new IOException("下载请求失败，HTTP " + code);
+            }
+            long total = connection.getContentLengthLong();
+            runOnUiThread(() -> {
+                progressDialog.setIndeterminate(total <= 0);
+                progressDialog.setProgress(0);
+                progressDialog.setMessage("正在下载 " + targetFile.getName());
+            });
+            try (InputStream in = connection.getInputStream();
+                 FileOutputStream out = new FileOutputStream(partFile)) {
+                byte[] buffer = new byte[1024 * 256];
+                long downloaded = 0;
+                int lastPercent = -1;
+                long lastShownMb = -1;
+                int read;
+                while ((read = in.read(buffer)) != -1) {
+                    out.write(buffer, 0, read);
+                    downloaded += read;
+                    if (total > 0) {
+                        int percent = (int) Math.min(100, downloaded * 100 / total);
+                        if (percent != lastPercent && (percent == 100 || percent - lastPercent >= 2)) {
+                            lastPercent = percent;
+                            String text = "正在下载 " + targetFile.getName() + "：" + percent + "%";
+                            int progress = percent;
+                            runOnUiThread(() -> {
+                                result.setText(text);
+                                progressDialog.setProgress(progress);
+                            });
+                        }
+                    } else {
+                        long shownMb = downloaded / (1024 * 1024);
+                        if (shownMb != lastShownMb) {
+                            lastShownMb = shownMb;
+                            String text = "正在下载 " + targetFile.getName() + "：" + shownMb + " MB";
+                            runOnUiThread(() -> {
+                                result.setText(text);
+                                progressDialog.setMessage(text);
+                            });
+                        }
+                    }
+                }
+            }
+            if (targetFile.exists() && !targetFile.delete()) {
+                throw new IOException("无法替换旧模型文件：" + targetFile.getAbsolutePath());
+            }
+            if (!partFile.renameTo(targetFile)) {
+                throw new IOException("无法保存模型文件：" + targetFile.getAbsolutePath());
+            }
+        } finally {
+            connection.disconnect();
+            if (partFile.exists() && targetFile.length() == 0) {
+                //noinspection ResultOfMethodCallIgnored
+                partFile.delete();
+            }
+        }
+    }
+
+    private HttpURLConnection openConnection(String url) throws IOException {
+        URL current = new URL(url);
+        for (int i = 0; i < 5; ++i) {
+            HttpURLConnection connection = (HttpURLConnection) current.openConnection();
+            connection.setConnectTimeout(15000);
+            connection.setReadTimeout(30000);
+            connection.setInstanceFollowRedirects(false);
+            connection.setRequestProperty("User-Agent", "SimpleSpeech/0.1");
+            int code = connection.getResponseCode();
+            if (code >= 300 && code < 400) {
+                String location = connection.getHeaderField("Location");
+                connection.disconnect();
+                if (location == null || location.isEmpty()) {
+                    throw new IOException("重定向缺少 Location");
+                }
+                current = new URL(current, location);
+                continue;
+            }
+            return connection;
+        }
+        throw new IOException("重定向次数过多");
+    }
+
+    private String readUtf8(InputStream in) throws IOException {
+        byte[] buffer = new byte[8192];
+        StringBuilder builder = new StringBuilder();
+        int read;
+        while ((read = in.read(buffer)) != -1) {
+            builder.append(new String(buffer, 0, read, java.nio.charset.StandardCharsets.UTF_8));
+        }
+        return builder.toString();
+    }
+
+    private String encodePath(String path) throws IOException {
+        String[] parts = path.split("/");
+        StringBuilder encoded = new StringBuilder();
+        for (int i = 0; i < parts.length; ++i) {
+            if (i > 0) {
+                encoded.append('/');
+            }
+            encoded.append(URLEncoder.encode(parts[i], "UTF-8").replace("+", "%20"));
+        }
+        return encoded.toString();
+    }
+
+    private ModelDownloadSpec downloadSpecForModel(String modelName) {
+        if ("Hy-MT1.5-1.8B-1.25bit".equals(modelName)) {
+            return new ModelDownloadSpec(modelName, "tencent/Hy-MT1.5-1.8B-1.25bit-GGUF");
+        }
+        if ("Hy-MT1.5-1.8B-4bit".equals(modelName) || "Hy-MT1.5-1.8B-8bit".equals(modelName)) {
+            return new ModelDownloadSpec(modelName, "tencent/HY-MT1.5-1.8B-GGUF");
+        }
+        return null;
+    }
+
     private boolean hasModelFile(String root, String modelName) {
         String[] candidates;
         if ("Hy-MT1.5-1.8B-1.25bit".equals(modelName)) {
             candidates = new String[]{"Hy-MT1.5-1.8B-1.25bit", "Hy-MT1.5-1.8B-1.25bit-GGUF"};
         } else if ("Hy-MT1.5-1.8B-4bit".equals(modelName)) {
-            candidates = new String[]{"Hy-MT1.5-1.8B-4bit", "Hy-MT1.5-1.8B-1.25bit-GGUF"};
+            candidates = new String[]{"Hy-MT1.5-1.8B-4bit", "HY-MT1.5-1.8B-GGUF"};
         } else if ("Hy-MT1.5-1.8B-8bit".equals(modelName)) {
-            candidates = new String[]{"Hy-MT1.5-1.8B-8bit", "Hy-MT1.5-1.8B-1.25bit-GGUF"};
+            candidates = new String[]{"Hy-MT1.5-1.8B-8bit", "HY-MT1.5-1.8B-GGUF"};
         } else if ("Hy-MT1.5-1.8B-2bit".equals(modelName)) {
             candidates = new String[]{"Hy-MT1.5-1.8B-2bit", "Hy-MT1.5-1.8B-2bit-GGUF"};
         } else {
@@ -429,12 +664,30 @@ public class MainActivity extends Activity {
         }
         for (String candidate : candidates) {
             File dir = new File(root, candidate);
-            File[] files = dir.listFiles((d, name) -> name.toLowerCase(Locale.US).endsWith(".gguf"));
+            File[] files = dir.listFiles((d, name) ->
+                    name.toLowerCase(Locale.US).endsWith(".gguf") && fileMatchesModelName(name, modelName));
             if (files != null && files.length > 0) {
                 return true;
             }
         }
         return false;
+    }
+
+    private boolean fileMatchesModelName(String fileName, String modelName) {
+        String lowerName = fileName.toLowerCase(Locale.US);
+        if ("Hy-MT1.5-1.8B-1.25bit".equals(modelName)) {
+            return lowerName.contains("1.25bit") || lowerName.contains("stq");
+        }
+        if ("Hy-MT1.5-1.8B-4bit".equals(modelName)) {
+            return lowerName.contains("q4") || lowerName.contains("4bit");
+        }
+        if ("Hy-MT1.5-1.8B-8bit".equals(modelName)) {
+            return lowerName.contains("q8") || lowerName.contains("8bit");
+        }
+        if ("Hy-MT1.5-1.8B-2bit".equals(modelName)) {
+            return lowerName.contains("2bit");
+        }
+        return true;
     }
 
     private int parseMaxTokens(String value) {
@@ -507,6 +760,16 @@ public class MainActivity extends Activity {
         TranslationOutput(String text, String speed) {
             this.text = text;
             this.speed = speed;
+        }
+    }
+
+    private static final class ModelDownloadSpec {
+        final String modelName;
+        final String repoId;
+
+        ModelDownloadSpec(String modelName, String repoId) {
+            this.modelName = modelName;
+            this.repoId = repoId;
         }
     }
 }

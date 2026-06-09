@@ -23,6 +23,8 @@ namespace {
 constexpr const char * kTag = "SimpleSpeechNative";
 constexpr int kDefaultMaxPredictTokens = 64;
 constexpr int kMaxAllowedPredictTokens = 4096;
+constexpr uint32_t kCpuBatchTokens = 512;
+constexpr uint32_t kGpuBatchTokens = 1024;
 constexpr int kRepeatPenaltyLastN = 64;
 constexpr float kRepeatPenalty = 1.15f;
 constexpr int kSamplingTopK = 20;
@@ -60,10 +62,10 @@ std::vector<std::string> model_dir_candidates(const std::string &model) {
         return {"Hy-MT1.5-1.8B-1.25bit", "Hy-MT1.5-1.8B-1.25bit-GGUF"};
     }
     if (model == "Hy-MT1.5-1.8B-4bit") {
-        return {"Hy-MT1.5-1.8B-4bit", "Hy-MT1.5-1.8B-1.25bit-GGUF"};
+        return {"Hy-MT1.5-1.8B-4bit", "HY-MT1.5-1.8B-GGUF"};
     }
     if (model == "Hy-MT1.5-1.8B-8bit") {
-        return {"Hy-MT1.5-1.8B-8bit", "Hy-MT1.5-1.8B-1.25bit-GGUF"};
+        return {"Hy-MT1.5-1.8B-8bit", "HY-MT1.5-1.8B-GGUF"};
     }
     if (model == "Hy-MT1.5-1.8B-2bit") {
         return {"Hy-MT1.5-1.8B-2bit", "Hy-MT1.5-1.8B-2bit-GGUF"};
@@ -323,6 +325,10 @@ bool has_repeated_tail(const std::vector<llama_token> &tokens, int ngram, int re
     return true;
 }
 
+double tokens_per_second(int32_t n_tokens, double ms) {
+    return n_tokens > 0 && ms > 0.0 ? n_tokens * 1000.0 / ms : 0.0;
+}
+
 LlamaEngine * ensure_engine(const std::string &path, const std::string &backend_dir, bool use_gpu, std::string &error) {
     const bool can_use_gpu = use_gpu && !contains_ci(path, "1.25bit");
     if (!ensure_backends(backend_dir, can_use_gpu, error)) {
@@ -345,6 +351,7 @@ LlamaEngine * ensure_engine(const std::string &path, const std::string &backend_
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = gpu_layers;
+
     const auto load_start = std::chrono::steady_clock::now();
     __android_log_print(ANDROID_LOG_INFO, kTag, "loading model %s, ngl=%d", path.c_str(), gpu_layers);
     next->model = llama_model_load_from_file(path.c_str(), mparams);
@@ -356,7 +363,9 @@ LlamaEngine * ensure_engine(const std::string &path, const std::string &backend_
     next->vocab = llama_model_get_vocab(next->model);
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = next->n_ctx;
-    cparams.n_batch = 512;
+    const uint32_t batch_tokens = gpu_layers > 0 ? kGpuBatchTokens : kCpuBatchTokens;
+    cparams.n_batch = batch_tokens;
+    cparams.n_ubatch = batch_tokens;
     cparams.n_threads = next->n_threads;
     cparams.n_threads_batch = next->n_threads;
     cparams.no_perf = false;
@@ -383,8 +392,8 @@ LlamaEngine * ensure_engine(const std::string &path, const std::string &backend_
     g_engine = std::move(next);
     const auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - load_start).count();
-    __android_log_print(ANDROID_LOG_INFO, kTag, "loaded model %s with %d threads, ngl=%d in %lld ms",
-                        path.c_str(), g_engine->n_threads, g_engine->n_gpu_layers,
+    __android_log_print(ANDROID_LOG_INFO, kTag, "loaded model %s with %d threads, ngl=%d, batch=%u in %lld ms",
+                        path.c_str(), g_engine->n_threads, g_engine->n_gpu_layers, batch_tokens,
                         static_cast<long long>(load_ms));
     return g_engine.get();
 }
@@ -432,6 +441,7 @@ std::string run_llama_translation(
         if (llama_encode(engine->ctx, batch) != 0) {
             return "llama_encode 失败";
         }
+        llama_synchronize(engine->ctx);
         llama_token decoder_start = llama_model_decoder_start_token(engine->model);
         if (decoder_start == LLAMA_TOKEN_NULL) {
             decoder_start = llama_vocab_bos(engine->vocab);
@@ -499,17 +509,22 @@ std::string run_llama_translation(
     const long long decode_ms = prefill_ms >= 0 ? std::max<long long>(1,
             std::chrono::duration_cast<std::chrono::milliseconds>(infer_end - prefill_end).count()) :
             std::max<long long>(1, infer_ms);
-    const double prefill_tok_per_s = prefill_ms > 0 ? tokens.size() * 1000.0 / prefill_ms : 0.0;
-    const double decode_tok_per_s = generated_count > 0 ? generated_count * 1000.0 / decode_ms : 0.0;
     const llama_perf_context_data perf = llama_perf_context(engine->ctx);
     const llama_perf_sampler_data sampler_perf = llama_perf_sampler(engine->sampler);
+    const double wall_prefill_tok_per_s = prefill_ms > 0 ? tokens.size() * 1000.0 / prefill_ms : 0.0;
+    const double wall_decode_tok_per_s = generated_count > 0 ? generated_count * 1000.0 / decode_ms : 0.0;
+    const double perf_prefill_tok_per_s = tokens_per_second(perf.n_p_eval, perf.t_p_eval_ms);
+    const double perf_decode_tok_per_s = tokens_per_second(perf.n_eval, perf.t_eval_ms);
+    const double prefill_tok_per_s = perf_prefill_tok_per_s > 0.0 ? perf_prefill_tok_per_s : wall_prefill_tok_per_s;
+    const double decode_tok_per_s = perf_decode_tok_per_s > 0.0 ? perf_decode_tok_per_s : wall_decode_tok_per_s;
     __android_log_print(ANDROID_LOG_INFO, kTag,
-                        "translation synchronized in %lld ms, prefill=%lld ms %.2f tok/s, decode=%lld ms generated=%d %.2f tok/s, output_bytes=%zu",
+                        "translation synchronized in %lld ms, wall_prefill=%lld ms %.2f tok/s, wall_decode=%lld ms generated=%d %.2f tok/s, output_bytes=%zu",
                         static_cast<long long>(infer_ms), static_cast<long long>(prefill_ms),
-                        prefill_tok_per_s, decode_ms, generated_count, decode_tok_per_s, output.size());
+                        wall_prefill_tok_per_s, decode_ms, generated_count, wall_decode_tok_per_s, output.size());
     __android_log_print(ANDROID_LOG_INFO, kTag,
-                        "llama perf: p_eval=%.2f ms/%d tok, eval=%.2f ms/%d tok, sample=%.2f ms/%d tok, reused=%d",
-                        perf.t_p_eval_ms, perf.n_p_eval, perf.t_eval_ms, perf.n_eval,
+                        "llama perf: p_eval=%.2f ms/%d tok %.2f tok/s, eval=%.2f ms/%d tok %.2f tok/s, sample=%.2f ms/%d tok, reused=%d",
+                        perf.t_p_eval_ms, perf.n_p_eval, perf_prefill_tok_per_s,
+                        perf.t_eval_ms, perf.n_eval, perf_decode_tok_per_s,
                         sampler_perf.t_sample_ms, sampler_perf.n_sample, perf.n_reused);
     std::ostringstream result;
     result << output
